@@ -136,8 +136,8 @@ public:
 	void insert(const json_uri &uri, const std::shared_ptr<schema> &s)
 	{
 		auto &file = get_or_create_file(uri.location());
-		auto schema = file.schemas.lower_bound(uri.fragment());
-		if (schema != file.schemas.end() && !(file.schemas.key_comp()(uri.fragment(), schema->first))) {
+		auto found = file.schemas.lower_bound(uri.fragment());
+		if (found != file.schemas.end() && !(file.schemas.key_comp()(uri.fragment(), found->first))) {
 			throw std::invalid_argument("schema with " + uri.to_string() + " already inserted");
 			return;
 		}
@@ -176,9 +176,9 @@ public:
 		auto &file = get_or_create_file(uri.location());
 
 		// existing schema
-		auto schema = file.schemas.find(uri.fragment());
-		if (schema != file.schemas.end())
-			return schema->second;
+		auto found = file.schemas.find(uri.fragment());
+		if (found != file.schemas.end())
+			return found->second;
 
 		// referencing an unknown keyword, turn it into schema
 		//
@@ -207,10 +207,10 @@ public:
 		}
 	}
 
-	void set_root_schema(json schema)
+	void set_root_schema(json a_schema)
 	{
 		files_.clear();
-		root_ = schema::make(schema, this, {}, {{"#"}});
+		root_ = schema::make(a_schema, this, {}, {{"#"}});
 
 		// load all files which have not yet been loaded
 		do {
@@ -601,7 +601,7 @@ class string : public schema
 	std::size_t utf8_length(const std::string &s) const
 	{
 		size_t len = 0;
-		for (const unsigned char &c : s)
+		for (const unsigned char c : s)
 			if ((c & 0xc0) != 0x80)
 				len++;
 		return len;
@@ -1114,6 +1114,9 @@ std::shared_ptr<schema> type_schema::make(json &schema,
 		return std::make_shared<array>(schema, root, uris);
 
 	case json::value_t::discarded: // not a real type - silence please
+		break;
+
+	case json::value_t::binary: // not available for json
 		break;
 	}
 	return nullptr;
