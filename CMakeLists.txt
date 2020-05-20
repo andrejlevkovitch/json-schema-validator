@@ -8,13 +8,16 @@ cmake_minimum_required(VERSION 3.2)
 option(BUILD_TESTS      "Build tests"    ON)
 option(BUILD_EXAMPLES   "Build examples" ON)
 
+include(build.cmake)
+
 # the library
 add_library(nlohmann_json_schema_validator
     src/json-schema-draft7.json.cpp
     src/json-uri.cpp
     src/json-validator.cpp
     src/json-patch.cpp
-    src/string-format-check.cpp)
+    src/string-format-check.cpp
+    src/constraints.cpp)
 
 target_include_directories(nlohmann_json_schema_validator
     PUBLIC

@@ -14,11 +14,19 @@
 #include <set>
 #include <sstream>
 
+#include "constraints.hpp"
+#include <list>
+
 using nlohmann::json;
 using nlohmann::json_patch;
 using nlohmann::json_uri;
 using nlohmann::json_schema::root_schema;
 using namespace nlohmann::json_schema;
+
+using constraint = nlohmann::constraint;
+using constraints = std::list<constraint>;
+using constraint_error = nlohmann::constraint_error;
+using constraint_factory = nlohmann::constraint_factory;
 
 #ifdef JSON_SCHEMA_BOOST_REGEX
 #	include <boost/regex.hpp>
@@ -34,6 +42,37 @@ namespace
 {
 
 static const json EmptyDefault{};
+
+static std::map<std::string, std::function<constraint(const json &)>> generic_keywords{
+    {"enum", constraint_factory::create_enum},
+    {"const", constraint_factory::create_const},
+};
+
+static std::map<std::string, std::function<constraint(const json &)>> numeric_keywords{
+    {"minimum", constraint_factory::create_minimum},
+    {"maximum", constraint_factory::create_maximum},
+    {"exclusiveMinimum", constraint_factory::create_exclusiveMinimum},
+    {"exclusiveMaximum", constraint_factory::create_exclusiveMaximum},
+    {"multipleOf", constraint_factory::create_multipleOf},
+};
+
+static std::map<std::string, std::function<constraint(const json &)>> string_keywords{
+    {"minLength", constraint_factory::create_minLength},
+    {"maxLength", constraint_factory::create_maxLength},
+    {"pattern", constraint_factory::create_pattern},
+};
+
+static std::map<std::string, std::function<constraint(const json &)>> array_keywords{
+    {"minItems", constraint_factory::create_minItems},
+    {"maxItems", constraint_factory::create_maxItems},
+    {"uniqueItems", constraint_factory::create_uniqueItems},
+};
+
+static std::map<std::string, std::function<constraint(const json &)>> object_keywords{
+    {"minProperties", constraint_factory::create_minProperties},
+    {"maxProperties", constraint_factory::create_maxProperties},
+    //  {"required", constraint_factory::create_required},
+};
 
 class schema
 {
@@ -404,14 +443,14 @@ class type_schema : public schema
 {
 	json defaultValue_{};
 	std::vector<std::shared_ptr<schema>> type_;
-	std::pair<bool, json> enum_, const_;
 	std::vector<std::shared_ptr<schema>> logic_;
+
+	constraints constraints_;
 
 	static std::shared_ptr<schema> make(json &schema,
 	                                    json::value_t type,
 	                                    root_schema *,
-	                                    const std::vector<nlohmann::json_uri> &,
-	                                    std::set<std::string> &);
+	                                    const std::vector<nlohmann::json_uri> &);
 
 	std::shared_ptr<schema> if_, then_, else_;
 
@@ -430,21 +469,12 @@ class type_schema : public schema
 		else
 			e.error(ptr, instance, "unexpected instance type");
 
-		if (enum_.first) {
-			bool seen_in_enum = false;
-			for (auto &v : enum_.second)
-				if (instance == v) {
-					seen_in_enum = true;
-					break;
-				}
-
-			if (!seen_in_enum)
-				e.error(ptr, instance, "instance not found in required enum");
+		for (const constraint &cns : constraints_) {
+			constraint_error err = cns(instance);
+			if (err.fail()) {
+				e.error(ptr, instance, err.msg());
+			}
 		}
-
-		if (const_.first &&
-		    const_.second != instance)
-			e.error(ptr, instance, "instance not const");
 
 		for (auto l : logic_)
 			l->validate(ptr, instance, patch, e);
@@ -480,12 +510,10 @@ public:
 		    {"number", json::value_t::number_float},
 		};
 
-		std::set<std::string> known_keywords;
-
 		auto attr = sch.find("type");
 		if (attr == sch.end()) // no type field means all sub-types possible
 			for (auto &t : schema_types)
-				type_[(uint8_t) t.second] = type_schema::make(sch, t.second, root, uris, known_keywords);
+				type_[(uint8_t) t.second] = type_schema::make(sch, t.second, root, uris);
 		else {
 			switch (attr.value().type()) { // "type": "type"
 
@@ -493,14 +521,14 @@ public:
 				auto schema_type = attr.value().get<std::string>();
 				for (auto &t : schema_types)
 					if (t.first == schema_type)
-						type_[(uint8_t) t.second] = type_schema::make(sch, t.second, root, uris, known_keywords);
+						type_[(uint8_t) t.second] = type_schema::make(sch, t.second, root, uris);
 			} break;
 
 			case json::value_t::array: // "type": ["type1", "type2"]
 				for (auto &schema_type : attr.value())
 					for (auto &t : schema_types)
 						if (t.first == schema_type)
-							type_[(uint8_t) t.second] = type_schema::make(sch, t.second, root, uris, known_keywords);
+							type_[(uint8_t) t.second] = type_schema::make(sch, t.second, root, uris);
 				break;
 
 			default:
@@ -515,9 +543,6 @@ public:
 			defaultValue_ = defaultAttr.value();
 		}
 
-		for (auto &key : known_keywords)
-			sch.erase(key);
-
 		// with nlohmann::json float instance (but number in schema-definition) can be seen as unsigned or integer -
 		// reuse the number-validator for integer values as well, if they have not been specified explicitly
 		if (type_[(uint8_t) json::value_t::number_float] && !type_[(uint8_t) json::value_t::number_integer])
@@ -527,16 +552,11 @@ public:
 		// we stick with JSON-schema: use the integer-validator if instance-value is unsigned
 		type_[(uint8_t) json::value_t::number_unsigned] = type_[(uint8_t) json::value_t::number_integer];
 
-		attr = sch.find("enum");
-		if (attr != sch.end()) {
-			enum_ = {true, attr.value()};
-			sch.erase(attr);
-		}
-
-		attr = sch.find("const");
-		if (attr != sch.end()) {
-			const_ = {true, attr.value()};
-			sch.erase(attr);
+		for (const auto &keyword : generic_keywords) {
+			auto found = sch.find(keyword.first);
+			if (found != sch.end()) {
+				constraints_.emplace_back(keyword.second(found.value()));
+			}
 		}
 
 		attr = sch.find("not");
@@ -588,48 +608,18 @@ public:
 
 class string : public schema
 {
-	std::pair<bool, size_t> maxLength_{false, 0};
-	std::pair<bool, size_t> minLength_{false, 0};
-
-#ifndef NO_STD_REGEX
-	std::pair<bool, REGEX_NAMESPACE::regex> pattern_{false, REGEX_NAMESPACE::regex()};
-	std::string patternString_;
-#endif
+	constraints constraints_;
 
 	std::pair<bool, std::string> format_;
 
-	std::size_t utf8_length(const std::string &s) const
-	{
-		size_t len = 0;
-		for (const unsigned char c : s)
-			if ((c & 0xc0) != 0x80)
-				len++;
-		return len;
-	}
-
 	void validate(const json::json_pointer &ptr, const json &instance, json_patch &, error_handler &e) const override
 	{
-		if (minLength_.first) {
-			if (utf8_length(instance) < minLength_.second) {
-				std::ostringstream s;
-				s << "instance is too short as per minLength:" << minLength_.second;
-				e.error(ptr, instance, s.str());
+		for (const constraint &cns : constraints_) {
+			constraint_error err = cns(instance);
+			if (err.fail()) {
+				e.error(ptr, instance, err.msg());
 			}
 		}
-
-		if (maxLength_.first) {
-			if (utf8_length(instance) > maxLength_.second) {
-				std::ostringstream s;
-				s << "instance is too long as per maxLength: " << maxLength_.second;
-				e.error(ptr, instance, s.str());
-			}
-		}
-
-#ifndef NO_STD_REGEX
-		if (pattern_.first &&
-		    !REGEX_NAMESPACE::regex_search(instance.get<std::string>(), pattern_.second))
-			e.error(ptr, instance, "instance does not match regex pattern: " + patternString_);
-#endif
 
 		if (format_.first) {
 			if (root_->format_check() == nullptr)
@@ -648,29 +638,15 @@ public:
 	string(json &sch, root_schema *root)
 	    : schema(root)
 	{
-		auto attr = sch.find("maxLength");
-		if (attr != sch.end()) {
-			maxLength_ = {true, attr.value()};
-			sch.erase(attr);
+		for (const auto &keyword : string_keywords) {
+			auto found = sch.find(keyword.first);
+			if (found != sch.end()) {
+				constraints_.emplace_back(keyword.second(found.value()));
+				sch.erase(found);
+			}
 		}
 
-		attr = sch.find("minLength");
-		if (attr != sch.end()) {
-			minLength_ = {true, attr.value()};
-			sch.erase(attr);
-		}
-
-#ifndef NO_STD_REGEX
-		attr = sch.find("pattern");
-		if (attr != sch.end()) {
-			patternString_ = attr.value();
-			pattern_ = {true, REGEX_NAMESPACE::regex(attr.value().get<std::string>(),
-			                                         REGEX_NAMESPACE::regex::ECMAScript)};
-			sch.erase(attr);
-		}
-#endif
-
-		attr = sch.find("format");
+		auto attr = sch.find("format");
 		if (attr != sch.end()) {
 			format_ = {true, attr.value()};
 			sch.erase(attr);
@@ -678,89 +654,37 @@ public:
 	}
 };
 
-template <typename T>
 class numeric : public schema
 {
-	std::pair<bool, T> maximum_{false, 0};
-	std::pair<bool, T> minimum_{false, 0};
-
-	bool exclusiveMaximum_ = false;
-	bool exclusiveMinimum_ = false;
-
-	std::pair<bool, json::number_float_t> multipleOf_{false, 0};
-
-	// multipleOf - if the remainder of the division is 0 -> OK
-	bool violates_multiple_of(T x) const
-	{
-		double res = std::remainder(x, multipleOf_.second);
-		double eps = std::nextafter(x, 0) - x;
-		return std::fabs(res) > std::fabs(eps);
-	}
+	constraints constraints_;
 
 	void validate(const json::json_pointer &ptr, const json &instance, json_patch &, error_handler &e) const override
 	{
-		T value = instance; // conversion of json to value_type
-
-		if (multipleOf_.first && value != 0) // zero is multiple of everything
-			if (violates_multiple_of(value))
-				e.error(ptr, instance, "instance is not a multiple of " + std::to_string(multipleOf_.second));
-
-		if (maximum_.first)
-			if ((exclusiveMaximum_ && value >= maximum_.second) ||
-			    value > maximum_.second)
-				e.error(ptr, instance, "instance exceeds maximum of " + std::to_string(maximum_.second));
-
-		if (minimum_.first)
-			if ((exclusiveMinimum_ && value <= minimum_.second) ||
-			    value < minimum_.second)
-				e.error(ptr, instance, "instance is below minimum of " + std::to_string(minimum_.second));
+		for (const constraint &cns : constraints_) {
+			constraint_error err = cns(instance);
+			if (err.fail()) {
+				e.error(ptr, instance, err.msg());
+			}
+		}
 	}
 
 public:
-	numeric(const json &sch, root_schema *root, std::set<std::string> &kw)
+	numeric(json &sch, root_schema *root)
 	    : schema(root)
 	{
-		auto attr = sch.find("maximum");
-		if (attr != sch.end()) {
-			maximum_ = {true, attr.value()};
-			kw.insert("maximum");
-		}
-
-		attr = sch.find("minimum");
-		if (attr != sch.end()) {
-			minimum_ = {true, attr.value()};
-			kw.insert("minimum");
-		}
-
-		attr = sch.find("exclusiveMaximum");
-		if (attr != sch.end()) {
-			exclusiveMaximum_ = true;
-			maximum_ = {true, attr.value()};
-			kw.insert("exclusiveMaximum");
-		}
-
-		attr = sch.find("exclusiveMinimum");
-		if (attr != sch.end()) {
-			minimum_ = {true, attr.value()};
-			exclusiveMinimum_ = true;
-			kw.insert("exclusiveMinimum");
-		}
-
-		attr = sch.find("multipleOf");
-		if (attr != sch.end()) {
-			multipleOf_ = {true, attr.value()};
-			kw.insert("multipleOf");
+		for (const auto &keyword : numeric_keywords) {
+			auto found = sch.find(keyword.first);
+			if (found != sch.end()) {
+				constraints_.emplace_back(keyword.second(found.value()));
+				sch.erase(found);
+			}
 		}
 	}
 };
 
 class null : public schema
 {
-	void validate(const json::json_pointer &ptr, const json &instance, json_patch &, error_handler &e) const override
-	{
-		if (!instance.is_null())
-			e.error(ptr, instance, "expected to be null");
-	}
+	void validate(const json::json_pointer &, const json &, json_patch &, error_handler &) const override {}
 
 public:
 	null(json &, root_schema *root)
@@ -817,8 +741,7 @@ public:
 
 class object : public schema
 {
-	std::pair<bool, size_t> maxProperties_{false, 0};
-	std::pair<bool, size_t> minProperties_{false, 0};
+	constraints constraints_;
 	std::vector<std::string> required_;
 
 	std::map<std::string, std::shared_ptr<schema>> properties_;
@@ -833,11 +756,12 @@ class object : public schema
 
 	void validate(const json::json_pointer &ptr, const json &instance, json_patch &patch, error_handler &e) const override
 	{
-		if (maxProperties_.first && instance.size() > maxProperties_.second)
-			e.error(ptr, instance, "too many properties");
-
-		if (minProperties_.first && instance.size() < minProperties_.second)
-			e.error(ptr, instance, "too few properties");
+		for (const constraint &cns : constraints_) {
+			constraint_error err = cns(instance);
+			if (err.fail()) {
+				e.error(ptr, instance, err.msg());
+			}
+		}
 
 		for (auto &r : required_)
 			if (instance.find(r) == instance.end())
@@ -898,19 +822,15 @@ public:
 	       const std::vector<nlohmann::json_uri> &uris)
 	    : schema(root)
 	{
-		auto attr = sch.find("maxProperties");
-		if (attr != sch.end()) {
-			maxProperties_ = {true, attr.value()};
-			sch.erase(attr);
+		for (const auto &keyword : object_keywords) {
+			auto found = sch.find(keyword.first);
+			if (found != sch.end()) {
+				constraints_.emplace_back(keyword.second(found.value()));
+				sch.erase(found);
+			}
 		}
 
-		attr = sch.find("minProperties");
-		if (attr != sch.end()) {
-			minProperties_ = {true, attr.value()};
-			sch.erase(attr);
-		}
-
-		attr = sch.find("required");
+		auto attr = sch.find("required");
 		if (attr != sch.end()) {
 			required_ = attr.value().get<std::vector<std::string>>();
 			sch.erase(attr);
@@ -972,9 +892,7 @@ public:
 
 class array : public schema
 {
-	std::pair<bool, size_t> maxItems_{false, 0};
-	std::pair<bool, size_t> minItems_{false, 0};
-	bool uniqueItems_ = false;
+	constraints constraints_;
 
 	std::shared_ptr<schema> items_schema_;
 
@@ -985,17 +903,10 @@ class array : public schema
 
 	void validate(const json::json_pointer &ptr, const json &instance, json_patch &patch, error_handler &e) const override
 	{
-		if (maxItems_.first && instance.size() > maxItems_.second)
-			e.error(ptr, instance, "array has too many items");
-
-		if (minItems_.first && instance.size() < minItems_.second)
-			e.error(ptr, instance, "array has too few items");
-
-		if (uniqueItems_) {
-			for (auto it = instance.cbegin(); it != instance.cend(); ++it) {
-				auto v = std::find(it + 1, instance.end(), *it);
-				if (v != instance.end())
-					e.error(ptr, instance, "items have to be unique for this array");
+		for (const constraint &cns : constraints_) {
+			constraint_error err = cns(instance);
+			if (err.fail()) {
+				e.error(ptr, instance, err.msg());
 			}
 		}
 
@@ -1042,25 +953,15 @@ public:
 	array(json &sch, root_schema *root, const std::vector<nlohmann::json_uri> &uris)
 	    : schema(root)
 	{
-		auto attr = sch.find("maxItems");
-		if (attr != sch.end()) {
-			maxItems_ = {true, attr.value()};
-			sch.erase(attr);
+		for (const auto &keyword : array_keywords) {
+			auto found = sch.find(keyword.first);
+			if (found != sch.end()) {
+				constraints_.emplace_back(keyword.second(found.value()));
+				sch.erase(found);
+			}
 		}
 
-		attr = sch.find("minItems");
-		if (attr != sch.end()) {
-			minItems_ = {true, attr.value()};
-			sch.erase(attr);
-		}
-
-		attr = sch.find("uniqueItems");
-		if (attr != sch.end()) {
-			uniqueItems_ = attr.value();
-			sch.erase(attr);
-		}
-
-		attr = sch.find("items");
+		auto attr = sch.find("items");
 		if (attr != sch.end()) {
 
 			if (attr.value().type() == json::value_t::array) {
@@ -1092,8 +993,7 @@ public:
 std::shared_ptr<schema> type_schema::make(json &schema,
                                           json::value_t type,
                                           root_schema *root,
-                                          const std::vector<nlohmann::json_uri> &uris,
-                                          std::set<std::string> &kw)
+                                          const std::vector<nlohmann::json_uri> &uris)
 {
 	switch (type) {
 	case json::value_t::null:
@@ -1101,9 +1001,8 @@ std::shared_ptr<schema> type_schema::make(json &schema,
 
 	case json::value_t::number_unsigned:
 	case json::value_t::number_integer:
-		return std::make_shared<numeric<json::number_integer_t>>(schema, root, kw);
 	case json::value_t::number_float:
-		return std::make_shared<numeric<json::number_float_t>>(schema, root, kw);
+		return std::make_shared<numeric>(schema, root);
 	case json::value_t::string:
 		return std::make_shared<string>(schema, root);
 	case json::value_t::boolean:
