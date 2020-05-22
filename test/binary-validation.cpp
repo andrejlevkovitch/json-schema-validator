@@ -57,6 +57,19 @@ const json array_of_types_without_binary = json::parse(R"(
 }
 )");
 
+const json binary_with_mime = json::parse(R"(
+{
+  "type": "object",
+  "properties": {
+    "binary_data": {
+      "type": "string",
+      "contentEncoding": "binary",
+      "contentMediaType": "text/plain"
+    }
+  }
+}
+)");
+
 class store_ptr_err_handler : public nlohmann::json_schema::basic_error_handler
 {
 	void error(const nlohmann::json::json_pointer &ptr, const json &, const std::string &message) override
@@ -88,7 +101,7 @@ int main()
 	std::string as_binary = "hello world";
 	std::copy(as_binary.begin(), as_binary.end(), std::back_inserter(arr));
 
-	json binary = json::binary_array(arr);
+	json binary = json::binary(arr);
 
 	// all right
 	store_ptr_err_handler err{};
@@ -129,6 +142,24 @@ int main()
 	val.validate({{"something", binary}}, err);
 	EXPECT_EQ(err.failed_pointers.size(), 1);
 	EXPECT_EQ(err.failed_pointers[0], "/something");
+	err.reset();
+
+	//////////////////
+	// check binary with setting contetnMimeType
+
+	// ok, because in binary simple text
+	val.set_root_schema(binary_with_mime);
+	val.validate({{"binary_data", binary}}, err);
+	EXPECT_EQ(err.failed_pointers.size(), 0);
+	err.reset();
+
+	// fail, because in binary is json
+	std::string some_json = R"({"hello": "world"})";
+	json::binary_t json_as_binary;
+	std::copy(some_json.begin(), some_json.end(), std::back_inserter(json_as_binary));
+	json binary_json = json::binary(json_as_binary);
+	val.validate({{"binary_data", binary_json}}, err);
+	EXPECT_EQ(err.failed_pointers.size(), 1);
 	err.reset();
 
 	return error_count;

@@ -8,6 +8,8 @@ cmake_minimum_required(VERSION 3.2)
 option(BUILD_TESTS      "Build tests"    ON)
 option(BUILD_EXAMPLES   "Build examples" ON)
 
+find_library(MAGIC_LIB NAMES magic)
+
 # the library
 add_library(nlohmann_json_schema_validator
     src/json-schema-draft7.json.cpp
@@ -15,6 +17,9 @@ add_library(nlohmann_json_schema_validator
     src/json-validator.cpp
     src/json-patch.cpp
     src/string-format-check.cpp)
+
+target_link_libraries(nlohmann_json_schema_validator PRIVATE
+  ${MAGIC_LIB})
 
 target_include_directories(nlohmann_json_schema_validator
     PUBLIC
