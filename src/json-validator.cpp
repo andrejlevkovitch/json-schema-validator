@@ -14,6 +14,8 @@
 #include <set>
 #include <sstream>
 
+#include <magic.h>
+
 using nlohmann::json;
 using nlohmann::json_patch;
 using nlohmann::json_uri;
@@ -32,6 +34,25 @@ using namespace nlohmann::json_schema;
 
 namespace
 {
+
+std::string getContentMediaType(const void *data, int size)
+{
+	if (data == nullptr || size == 0) {
+		return "";
+	}
+
+	magic_t cookie = magic_open(MAGIC_MIME_TYPE);
+	if (cookie) {
+		std::string mime;
+		magic_load(cookie, nullptr);
+		const char *ptr = magic_buffer(cookie, data, size);
+		mime = ptr ? ptr : "";
+		magic_close(cookie);
+		return mime;
+	} else { // some error occured
+		throw std::bad_alloc{};
+	}
+}
 
 static const json EmptyDefault{};
 
@@ -1114,14 +1135,28 @@ public:
  */
 class binary : public schema
 {
-	void validate(const json::json_pointer &, const json &, json_patch &, error_handler &) const override
+	std::pair<bool, std::string> mediaType_;
+
+	void validate(const json::json_pointer &ptr, const json &instance, json_patch &, error_handler &e) const override
 	{
+		if (mediaType_.first) {
+			const json::binary_t &binary_data = instance.get_binary();
+			std::string instanceMediaType = getContentMediaType(binary_data.data(), binary_data.size());
+
+			if (instanceMediaType != mediaType_.second) {
+				e.error(ptr, instance, "expected media type: '" + mediaType_.second + "' but get: '" + instanceMediaType + "'");
+			}
+		}
 	}
 
 public:
-	binary(json &, root_schema *root)
-	    : schema(root)
+	binary(json &sch, root_schema *root)
+	    : schema(root), mediaType_{false, ""}
 	{
+		auto attr = sch.find("contentMediaType");
+		if (attr != sch.end()) {
+			mediaType_ = std::make_pair(true, attr.value().get<std::string>());
+		}
 	}
 };
 
