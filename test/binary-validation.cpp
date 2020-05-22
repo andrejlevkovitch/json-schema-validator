@@ -88,7 +88,7 @@ int main()
 	std::string as_binary = "hello world";
 	std::copy(as_binary.begin(), as_binary.end(), std::back_inserter(arr));
 
-	json binary = json::binary_array(arr);
+	json binary = json::binary(arr);
 
 	// all right
 	store_ptr_err_handler err{};
