@@ -4,7 +4,7 @@
 #include <nlohmann/json-schema.hpp>
 #include <nlohmann/json.hpp>
 
-int error_count = 0;
+static int error_count = 0;
 
 #define EXPECT_EQ(a, b)                                              \
 	do {                                                             \
@@ -13,6 +13,19 @@ int error_count = 0;
 			error_count++;                                           \
 		}                                                            \
 	} while (0)
+
+#define EXPECT_THROW(foo)            \
+	{                                \
+		bool ok = false;             \
+		try {                        \
+			foo;                     \
+		} catch (std::exception &) { \
+			ok = true;               \
+		}                            \
+		if (ok == false) {           \
+			error_count++;           \
+		}                            \
+	}
 
 using json = nlohmann::json;
 using validator = nlohmann::json_schema::json_validator;
@@ -57,19 +70,6 @@ const json array_of_types_without_binary = json::parse(R"(
 }
 )");
 
-const json binary_with_mime = json::parse(R"(
-{
-  "type": "object",
-  "properties": {
-    "binary_data": {
-      "type": "string",
-      "contentEncoding": "binary",
-      "contentMediaType": "text/plain"
-    }
-  }
-}
-)");
-
 class store_ptr_err_handler : public nlohmann::json_schema::basic_error_handler
 {
 	void error(const nlohmann::json::json_pointer &ptr, const json &, const std::string &message) override
@@ -91,10 +91,24 @@ public:
 	}
 };
 
+static void content(const std::string &contentEncoding, const std::string &contentMediaType, const json &instance)
+{
+	std::cerr << "mediaType: '" << contentMediaType << "', encoding: '" << contentEncoding << "'\n";
+
+	if (contentEncoding == "binary") {
+		if (instance.type() != json::value_t::binary) {
+			throw std::invalid_argument{"expected binary data"};
+		}
+	} else {
+		if (instance.type() == json::value_t::binary) {
+			throw std::invalid_argument{"expected string, but get binary"};
+		}
+	}
+}
+
 int main()
 {
-	validator val;
-	val.set_root_schema(bson_schema);
+	validator val(nullptr, nullptr, content);
 
 	// create some bson doc
 	json::binary_t arr;
@@ -103,8 +117,12 @@ int main()
 
 	json binary = json::binary(arr);
 
+	store_ptr_err_handler err;
+
+	/////////////////////////////////////
+	val.set_root_schema(bson_schema);
+
 	// all right
-	store_ptr_err_handler err{};
 	val.validate({{"standard_string", "some string"}, {"binary_data", binary}}, err);
 	EXPECT_EQ(err.failed_pointers.size(), 0);
 	err.reset();
@@ -126,9 +144,12 @@ int main()
 
 	// check simple types
 	val.set_root_schema(array_of_types);
-	val.validate({{"something", "string"}}, err);
 	val.validate({{"something", 1}}, err);
 	val.validate({{"something", false}}, err);
+	// TODO when we set `string` in array and set `contentEncoding` = "binary" - what it means? We expected string or binary?
+	// Or we expect only binary? Now if you set `contentEncoding` = "binary", then it means that you expect only binary data,
+	// not string
+	//val.validate({{"something", "string"}}, err); -> produce error about type
 	EXPECT_EQ(err.failed_pointers.size(), 0);
 	err.reset();
 
@@ -137,6 +158,7 @@ int main()
 	EXPECT_EQ(err.failed_pointers.size(), 0);
 	err.reset();
 
+	/////////////////////////////////////
 	// and check that you can't set binary data if contentEncoding don't set
 	val.set_root_schema(array_of_types_without_binary);
 	val.validate({{"something", binary}}, err);
@@ -144,23 +166,10 @@ int main()
 	EXPECT_EQ(err.failed_pointers[0], "/something");
 	err.reset();
 
-	//////////////////
-	// check binary with setting contetnMimeType
+	// check that without content callback you get exception with schema with contentEncoding or contentMeditType
+	validator val_no_content;
 
-	// ok, because in binary simple text
-	val.set_root_schema(binary_with_mime);
-	val.validate({{"binary_data", binary}}, err);
-	EXPECT_EQ(err.failed_pointers.size(), 0);
-	err.reset();
-
-	// fail, because in binary is json
-	std::string some_json = R"({"hello": "world"})";
-	json::binary_t json_as_binary;
-	std::copy(some_json.begin(), some_json.end(), std::back_inserter(json_as_binary));
-	json binary_json = json::binary(json_as_binary);
-	val.validate({{"binary_data", binary_json}}, err);
-	EXPECT_EQ(err.failed_pointers.size(), 1);
-	err.reset();
+	EXPECT_THROW(val_no_content.set_root_schema(bson_schema));
 
 	return error_count;
 }

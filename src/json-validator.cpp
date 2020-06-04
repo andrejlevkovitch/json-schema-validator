@@ -14,8 +14,6 @@
 #include <set>
 #include <sstream>
 
-#include <magic.h>
-
 using nlohmann::json;
 using nlohmann::json_patch;
 using nlohmann::json_uri;
@@ -34,25 +32,6 @@ using namespace nlohmann::json_schema;
 
 namespace
 {
-
-std::string getContentMediaType(const void *data, int size)
-{
-	if (data == nullptr || size == 0) {
-		return "";
-	}
-
-	magic_t cookie = magic_open(MAGIC_MIME_TYPE);
-	if (cookie) {
-		std::string mime;
-		magic_load(cookie, nullptr);
-		const char *ptr = magic_buffer(cookie, data, size);
-		mime = ptr ? ptr : "";
-		magic_close(cookie);
-		return mime;
-	} else { // some error occured
-		throw std::bad_alloc{};
-	}
-}
 
 static const json EmptyDefault{};
 
@@ -126,6 +105,7 @@ class root_schema : public schema
 {
 	schema_loader loader_;
 	format_checker format_check_;
+	content_checker content_check_;
 
 	std::shared_ptr<schema> root_;
 
@@ -149,10 +129,18 @@ class root_schema : public schema
 
 public:
 	root_schema(schema_loader &&loader,
-	            format_checker &&format)
-	    : schema(this), loader_(std::move(loader)), format_check_(std::move(format)) {}
+	            format_checker &&format,
+	            content_checker &&content)
+
+	    : schema(this),
+	      loader_(std::move(loader)),
+	      format_check_(std::move(format)),
+	      content_check_(std::move(content))
+	{
+	}
 
 	format_checker &format_check() { return format_check_; }
+	content_checker &content_check() { return content_check_; }
 
 	void insert(const json_uri &uri, const std::shared_ptr<schema> &s)
 	{
@@ -499,7 +487,6 @@ public:
 		    {"boolean", json::value_t::boolean},
 		    {"integer", json::value_t::number_integer},
 		    {"number", json::value_t::number_float},
-		    {"binary", json::value_t::binary},
 		};
 
 		std::set<std::string> known_keywords;
@@ -513,37 +500,17 @@ public:
 
 			case json::value_t::string: {
 				auto schema_type = attr.value().get<std::string>();
-
-				// add supporting validation binary types
-				if (schema_type == "string") {
-					auto found = sch.find("contentEncoding");
-					if (found != sch.end() && found->get<std::string>() == "binary") {
-						schema_type = "binary";
-					}
-				}
-
 				for (auto &t : schema_types)
 					if (t.first == schema_type)
 						type_[(uint8_t) t.second] = type_schema::make(sch, t.second, root, uris, known_keywords);
 			} break;
 
 			case json::value_t::array: // "type": ["type1", "type2"]
-			{
-				json type_array = attr.value();
-
-				auto has_string_type = std::find(type_array.begin(), type_array.end(), "string");
-				if (has_string_type != type_array.end()) {
-					auto encodingFound = sch.find("contentEncoding");
-					if (encodingFound != sch.end() && encodingFound.value() == "binary") {
-						type_array.emplace_back("binary");
-					}
-				}
-
-				for (auto &schema_type : type_array)
+				for (auto &schema_type : attr.value())
 					for (auto &t : schema_types)
 						if (t.first == schema_type)
 							type_[(uint8_t) t.second] = type_schema::make(sch, t.second, root, uris, known_keywords);
-			} break;
+				break;
 
 			default:
 				break;
@@ -568,6 +535,11 @@ public:
 		// #54: JSON-schema does not differentiate between unsigned and signed integer - nlohmann::json does
 		// we stick with JSON-schema: use the integer-validator if instance-value is unsigned
 		type_[(uint8_t) json::value_t::number_unsigned] = type_[(uint8_t) json::value_t::number_integer];
+
+		// special for binary types
+		if (type_[(uint8_t) json::value_t::string]) {
+			type_[(uint8_t) json::value_t::binary] = type_[(uint8_t) json::value_t::string];
+		}
 
 		attr = sch.find("enum");
 		if (attr != sch.end()) {
@@ -639,11 +611,12 @@ class string : public schema
 #endif
 
 	std::pair<bool, std::string> format_;
+	std::tuple<bool, std::string, std::string> content_{false, "", ""};
 
 	std::size_t utf8_length(const std::string &s) const
 	{
 		size_t len = 0;
-		for (const unsigned char c : s)
+		for (unsigned char c : s)
 			if ((c & 0xc0) != 0x80)
 				len++;
 		return len;
@@ -665,6 +638,24 @@ class string : public schema
 				s << "instance is too long as per maxLength: " << maxLength_.second;
 				e.error(ptr, instance, s.str());
 			}
+		}
+
+		if (std::get<0>(content_)) {
+			if (root_->content_check() == nullptr)
+				e.error(ptr, instance, std::string("a content checker was not provided but a contentEncoding or contentMediaType for this string have been present: '") + std::get<1>(content_) + "' '" + std::get<2>(content_) + "'");
+			else {
+				try {
+					root_->content_check()(std::get<1>(content_), std::get<2>(content_), instance);
+				} catch (const std::exception &ex) {
+					e.error(ptr, instance, std::string("content-checking failed: ") + ex.what());
+				}
+			}
+		} else if (instance.type() == json::value_t::binary) {
+			e.error(ptr, instance, "expected string, but get binary data");
+		}
+
+		if (instance.type() != json::value_t::string) {
+			return; // next checks only for strings
 		}
 
 #ifndef NO_STD_REGEX
@@ -700,6 +691,37 @@ public:
 		if (attr != sch.end()) {
 			minLength_ = {true, attr.value()};
 			sch.erase(attr);
+		}
+
+		attr = sch.find("contentEncoding");
+		if (attr != sch.end()) {
+			std::get<0>(content_) = true;
+			std::get<1>(content_) = attr.value().get<std::string>();
+
+			// special case for nlohmann::json-binary-types
+			//
+			// https://github.com/pboettch/json-schema-validator/pull/114
+			//
+			// We cannot use explicitly in a schema: {"type": "binary"} or
+			// "type": ["binary", "number"] we have to be implicit. For a
+			// schema where "contentEncoding" is set to "binary", an instance
+			// of type json::value_t::binary is accepted. If a
+			// contentEncoding-callback has to be provided and is called
+			// accordingly. For encoding=binary, no other type validations are done
+
+			sch.erase(attr);
+		}
+
+		attr = sch.find("contentMediaType");
+		if (attr != sch.end()) {
+			std::get<0>(content_) = true;
+			std::get<2>(content_) = attr.value().get<std::string>();
+
+			sch.erase(attr);
+		}
+
+		if (std::get<0>(content_) == true && root_->content_check() == nullptr) {
+			throw std::invalid_argument{"schema contains contentEncoding/contentMediaType but content checker was not set"};
 		}
 
 #ifndef NO_STD_REGEX
@@ -1131,35 +1153,6 @@ public:
 	}
 };
 
-/**\brief just a placeholder
- */
-class binary : public schema
-{
-	std::pair<bool, std::string> mediaType_;
-
-	void validate(const json::json_pointer &ptr, const json &instance, json_patch &, error_handler &e) const override
-	{
-		if (mediaType_.first) {
-			const json::binary_t &binary_data = instance.get_binary();
-			std::string instanceMediaType = getContentMediaType(binary_data.data(), binary_data.size());
-
-			if (instanceMediaType != mediaType_.second) {
-				e.error(ptr, instance, "expected media type: '" + mediaType_.second + "' but get: '" + instanceMediaType + "'");
-			}
-		}
-	}
-
-public:
-	binary(json &sch, root_schema *root)
-	    : schema(root), mediaType_{false, ""}
-	{
-		auto attr = sch.find("contentMediaType");
-		if (attr != sch.end()) {
-			mediaType_ = std::make_pair(true, attr.value().get<std::string>());
-		}
-	}
-};
-
 std::shared_ptr<schema> type_schema::make(json &schema,
                                           json::value_t type,
                                           root_schema *root,
@@ -1187,8 +1180,8 @@ std::shared_ptr<schema> type_schema::make(json &schema,
 	case json::value_t::discarded: // not a real type - silence please
 		break;
 
-	case json::value_t::binary: // can use for validate bson or other binary representation of json
-		return std::make_shared<binary>(schema, root);
+	case json::value_t::binary:
+		break;
 	}
 	return nullptr;
 }
@@ -1283,19 +1276,33 @@ namespace json_schema
 {
 
 json_validator::json_validator(schema_loader loader,
-                               format_checker format)
-    : root_(std::unique_ptr<root_schema>(new root_schema(std::move(loader), std::move(format))))
+                               format_checker format,
+                               content_checker content)
+    : root_(std::unique_ptr<root_schema>(new root_schema(std::move(loader),
+                                                         std::move(format),
+                                                         std::move(content))))
 {
 }
 
-json_validator::json_validator(const json &schema, schema_loader loader, format_checker format)
-    : json_validator(std::move(loader), std::move(format))
+json_validator::json_validator(const json &schema,
+                               schema_loader loader,
+                               format_checker format,
+                               content_checker content)
+    : json_validator(std::move(loader),
+                     std::move(format),
+                     std::move(content))
 {
 	set_root_schema(schema);
 }
 
-json_validator::json_validator(json &&schema, schema_loader loader, format_checker format)
-    : json_validator(std::move(loader), std::move(format))
+json_validator::json_validator(json &&schema,
+                               schema_loader loader,
+                               format_checker format,
+                               content_checker content)
+
+    : json_validator(std::move(loader),
+                     std::move(format),
+                     std::move(content))
 {
 	set_root_schema(std::move(schema));
 }
